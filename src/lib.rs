@@ -145,7 +145,9 @@ impl Drop for Mock {
     fn drop(&mut self) {
         self.rx.close();
         if let Ok(action) = self.rx.try_recv() {
-            panic!("Unused mock action: {:?}", action)
+            if !std::thread::panicking() {
+                panic!("Unused mock action: {:?}", action)
+            }
         }
     }
 }
