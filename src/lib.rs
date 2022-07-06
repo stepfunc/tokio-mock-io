@@ -180,11 +180,12 @@ impl tokio::io::AsyncRead for Mock {
                 Action::Read(bytes) => {
                     if buf.remaining() < bytes.len() {
                         panic!(
-                            "Expecting a read for {:?} but only space for {} bytes",
-                            bytes.as_slice(),
+                            "Expecting a read for at least {} bytes but only space for {} bytes",
+                            bytes.len(),
                             buf.remaining()
                         );
                     }
+                    buf.put_slice(bytes.as_slice());
                     self.tx.send(Event::Read).unwrap();
                     self.actions.pop_front();
                     Poll::Ready(Ok(()))
