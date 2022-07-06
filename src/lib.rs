@@ -48,6 +48,7 @@ clippy::all
     bare_trait_objects
 )]
 
+use std::collections::VecDeque;
 use std::io::{Error, ErrorKind};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -59,7 +60,7 @@ pub fn mock() -> (Mock, Handle) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
     let mock = Mock {
-        next: None,
+        actions: Default::default(),
         rx,
         tx: event_tx,
     };
@@ -69,8 +70,8 @@ pub fn mock() -> (Mock, Handle) {
 
 /// Mock object that can be used in lieu of a socket, etc
 pub struct Mock {
-    // the current action
-    next: Option<Action>,
+    // current queue of expected actions
+    actions: VecDeque<Action>,
     // how additional actions can be received
     rx: tokio::sync::mpsc::UnboundedReceiver<Action>,
     // how events get pushed back to the test
@@ -89,11 +90,6 @@ impl Handle {
         self.tx.send(Action::read(data)).unwrap()
     }
 
-    /// Queue a write operation on the Mock
-    pub fn write(&mut self, data: &[u8]) {
-        self.tx.send(Action::write(data)).unwrap()
-    }
-
     /// Queue a read error on the Mock
     pub fn read_error(&mut self, kind: ErrorKind) {
         self.tx.send(Action::read_error(kind)).unwrap()
@@ -110,112 +106,65 @@ impl Handle {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
-enum Direction {
-    Read,
-    Write,
-}
-
+/// events are things we queue up for the component under test
 #[derive(Debug)]
-enum ActionType {
-    Data(Vec<u8>),
-    Error(ErrorKind),
-}
-
-#[derive(Debug)]
-struct Action {
-    direction: Direction,
-    action_type: ActionType,
-}
-
-impl Action {
-    fn get_event(&self) -> Event {
-        match self.direction {
-            Direction::Read => match &self.action_type {
-                ActionType::Data(x) => Event::Read(x.len()),
-                ActionType::Error(x) => Event::ReadErr(*x),
-            },
-            Direction::Write => match &self.action_type {
-                ActionType::Data(x) => Event::Write(x.len()),
-                ActionType::Error(x) => Event::WriteErr(*x),
-            },
-        }
-    }
+enum Action {
+    Read(Vec<u8>),
+    ReadError(ErrorKind),
+    WriteError(ErrorKind),
 }
 
 /// Events that is produced as the Mock consumes an action
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// write operation was performed of the associated size
-    Write(usize),
-    /// read operation was performed of the associated size
-    Read(usize),
-    /// write error was returned by the mock
-    WriteErr(ErrorKind),
-    /// read error was returned by the mock
-    ReadErr(ErrorKind),
+    /// write operation was performed
+    Write(Vec<u8>),
+    /// all of the data in a queued read was consumed
+    Read,
+    /// queued write error was returned by the mock
+    WriteErr,
+    /// queued read error was returned by the mock
+    ReadErr,
 }
 
 impl Action {
     fn read(data: &[u8]) -> Self {
-        Self {
-            direction: Direction::Read,
-            action_type: ActionType::Data(data.to_vec()),
-        }
-    }
-
-    fn write(data: &[u8]) -> Self {
-        Self {
-            direction: Direction::Write,
-            action_type: ActionType::Data(data.to_vec()),
-        }
+        Self::Read(data.to_vec())
     }
 
     fn read_error(kind: ErrorKind) -> Self {
-        Self {
-            direction: Direction::Read,
-            action_type: ActionType::Error(kind),
-        }
+        Self::ReadError(kind)
     }
 
     fn write_error(kind: ErrorKind) -> Self {
-        Self {
-            direction: Direction::Write,
-            action_type: ActionType::Error(kind),
+        Self::WriteError(kind)
+    }
+}
+
+impl Drop for Mock {
+    fn drop(&mut self) {
+        self.rx.close();
+        if let Ok(action) = self.rx.try_recv() {
+            panic!("Unused mock action: {:?}", action)
         }
     }
 }
 
 impl Mock {
-    fn pop_event(&mut self, dir: Direction, x: Action) -> Option<ActionType> {
-        if x.direction == dir {
-            self.tx.send(x.get_event()).unwrap();
-            Some(x.action_type)
-        } else {
-            // it's not the right direction so store it
-            self.next = Some(x);
-            None
-        }
-    }
-
-    fn pop(&mut self, dir: Direction, cx: &mut Context) -> Option<ActionType> {
-        // if there is a pending action
-        if let Some(x) = self.next.take() {
-            return self.pop_event(dir, x);
-        }
-
+    fn front(&mut self, cx: &mut Context) -> Option<&Action> {
+        // we always poll the receiver
         if let Poll::Ready(action) = self.rx.poll_recv(cx) {
             match action {
                 None => {
                     panic!("The sending side of the channel was closed");
                 }
                 Some(x) => {
-                    return self.pop_event(dir, x);
+                    self.actions.push_back(x);
                 }
             }
         }
 
-        None
+        self.actions.front()
     }
 }
 
@@ -225,20 +174,30 @@ impl tokio::io::AsyncRead for Mock {
         cx: &mut Context,
         buf: &mut ReadBuf,
     ) -> Poll<std::io::Result<()>> {
-        match self.pop(Direction::Read, cx) {
+        match self.front(cx) {
             None => Poll::Pending,
-            Some(ActionType::Data(bytes)) => {
-                if buf.remaining() < bytes.len() {
-                    panic!(
-                        "Expecting a read for {:?} but only space for {} bytes",
-                        bytes.as_slice(),
-                        buf.remaining()
-                    );
+            Some(action) => match action {
+                Action::Read(bytes) => {
+                    if buf.remaining() < bytes.len() {
+                        panic!(
+                            "Expecting a read for {:?} but only space for {} bytes",
+                            bytes.as_slice(),
+                            buf.remaining()
+                        );
+                    }
+                    self.tx.send(Event::Read).unwrap();
+                    self.actions.pop_front();
+                    Poll::Ready(Ok(()))
                 }
-                buf.put_slice(bytes.as_slice());
-                Poll::Ready(Ok(()))
-            }
-            Some(ActionType::Error(kind)) => Poll::Ready(Err(kind.into())),
+                Action::ReadError(kind) => {
+                    let kind = *kind;
+                    let ret = Poll::Ready(Err(kind.into()));
+                    self.tx.send(Event::WriteErr).unwrap();
+                    self.actions.pop_front();
+                    ret
+                }
+                Action::WriteError(_) => Poll::Pending,
+            },
         }
     }
 }
@@ -249,13 +208,17 @@ impl tokio::io::AsyncWrite for Mock {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, Error>> {
-        match self.pop(Direction::Write, cx) {
-            None => panic!("unexpected write: {:?}", buf),
-            Some(ActionType::Data(bytes)) => {
-                assert_eq!(bytes.as_slice(), buf);
+        match self.front(cx) {
+            Some(Action::WriteError(kind)) => {
+                let kind = *kind;
+                self.tx.send(Event::WriteErr).unwrap();
+                self.actions.pop_front();
+                Poll::Ready(Err(kind.into()))
+            }
+            _ => {
+                self.tx.send(Event::Write(buf.to_vec())).unwrap();
                 Poll::Ready(Ok(buf.len()))
             }
-            Some(ActionType::Error(kind)) => Poll::Ready(Err(kind.into())),
         }
     }
 
