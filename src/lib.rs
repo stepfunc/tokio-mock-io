@@ -100,9 +100,14 @@ impl Handle {
         self.tx.send(Action::write_error(kind)).unwrap()
     }
 
-    /// Asynchronously wait for the next action to be consumed
+    /// Asynchronously wait for the next event
     pub async fn next_event(&mut self) -> Event {
         self.rx.recv().await.unwrap()
+    }
+
+    /// Pop the next event if present
+    pub fn pop_event(&mut self) -> Option<Event> {
+        self.rx.try_recv().ok()
     }
 }
 
