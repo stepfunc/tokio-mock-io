@@ -1,6 +1,7 @@
 [package]
 name = "tokio-mock-io"
-version = "0.1.0"
+version = "0.2.0"
+authors = ["Step Function I/O LLC <info@stepfunc.io>"]
 edition = "2021"
 
 [dependencies]
