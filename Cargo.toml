@@ -1,8 +1,12 @@
 [package]
-name = "tokio-mock-io"
+name = "sfio-tokio-mock-io"
 version = "0.2.0"
 authors = ["Step Function I/O LLC <info@stepfunc.io>"]
 edition = "2021"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+description = "Mock object that implements `AsyncRead` and `AsyncWrite` to facilitate testing of Tokio tasks"
+repository = "https://github.com/stepfunc/tokio-mock"
 
 [dependencies]
 tokio = { version = "1", features = ["sync"]}
